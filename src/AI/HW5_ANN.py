@@ -38,13 +38,16 @@ class AIPlayer(Player):
         self.MAX_DATASET_SIZE = 5000
         self.games_trained = 0
         
+        # Toggle: True = use ANN for utility prediction, False = use hardcoded weights
+        self.use_ann_for_utility = True  # Set to True to use ANN predictions
+        
         if os.path.exists(self.data_file):
             try:
                 data = np.load(self.data_file)
                 X_all = data['X_all']
                 Y_all = data['Y_all']
                 self.training_data = [
-                    [X_all[i].reshape(3, 1), np.array([[Y_all[i]]])]
+                    [X_all[i].reshape(4, 1), np.array([[Y_all[i]]])]
                     for i in range(len(X_all))
                 ]
                 if len(self.training_data) > self.MAX_DATASET_SIZE:
@@ -61,13 +64,19 @@ class AIPlayer(Player):
                     self.games_trained = int(data['games_trained'].item())
                 
                 print(f"Loaded {len(self.training_data)} examples and trained ANN (trained on {self.games_trained} games)")
+                if self.use_ann_for_utility:
+                    print(f"ANN weights: input_hidden={self.ann.weights_input_hidden.tolist()}, hidden_output={self.ann.weights_hidden_output.tolist()}")
             except Exception as e:
                 print(f"Error loading data: {e}. Starting fresh.")
                 self.training_data = []
                 self.ann = ANN()
+                if self.use_ann_for_utility:
+                    print(f"ANN weights: input_hidden={self.ann.weights_input_hidden.tolist()}, hidden_output={self.ann.weights_hidden_output.tolist()}")
         else:
             self.training_data = []
             self.ann = ANN()
+            if self.use_ann_for_utility:
+                print(f"ANN weights: input_hidden={self.ann.weights_input_hidden.tolist()}, hidden_output={self.ann.weights_hidden_output.tolist()}")
     
     ##
     #getPlacement
@@ -122,15 +131,22 @@ class AIPlayer(Player):
     ##
     def getMove(self, currentState):
         currentUtility = self.utility(currentState, currentState)
-        currentScores = self.scores_to_nn_input(self.compute_unit_composition_score(currentState), self.compute_route_score(currentState), self.compute_rsoldier_aggression_score(currentState))
+        currentScores = self.scores_to_nn_input(
+            self.compute_food_score(currentState),
+            self.compute_unit_composition_score(currentState),
+            self.compute_route_score(currentState),
+            self.compute_rsoldier_aggression_score(currentState)
+        )
         
-        # X is the input (3x1), Y is the output (1x1)
-        X = currentScores  # 3x1 array
-        Y = np.array([[currentUtility]])  # 1x1 array
-        training_example = [X, Y]  # array of arrays containing both
-        
-        # Add to persistent training data list
-        self.training_data.append(training_example)
+        # Only collect training data when using hardcoded weights (not when using ANN)
+        if not self.use_ann_for_utility:
+            # X is the input (4x1), Y is the output (1x1)
+            X = currentScores  # 4x1 array
+            Y = np.array([[currentUtility]])  # 1x1 array
+            training_example = [X, Y]  # array of arrays containing both
+            
+            # Add to persistent training data list
+            self.training_data.append(training_example)
         
         legalMoves = listAllLegalMoves(currentState)
         
@@ -160,6 +176,10 @@ class AIPlayer(Player):
     #registerWin
     #
     def registerWin(self, hasWon):
+        # Only train ANN when using hardcoded weights (not when using ANN for predictions)
+        if self.use_ann_for_utility:
+            return
+        
         if len(self.training_data) < 10:
             return
         
@@ -222,7 +242,7 @@ class AIPlayer(Player):
         next_inv = nextState.inventories[myId]
                 
         # Food progress (0-1, where 1 = food goal reached)
-        food_score = min(next_inv.foodCount / float(FOOD_GOAL), 1.0)
+        food_score = self.compute_food_score(nextState)
         
         # Route efficiency (already in [0,1])
         route_score = self.compute_route_score(nextState)
@@ -236,17 +256,26 @@ class AIPlayer(Player):
         aggro_score = self.compute_rsoldier_aggression_score(nextState)
         normalized_aggro = max(0, min(1, aggro_score))  
         
-        # Weights (should sum to 1.0 for proper scaling)
-        food_w = 0.6     # Food is most important for winning
-        route_w = 0.1     # efficiency 
-        units_w = 0.1     # more ants the better
-        aggro_w = 0.2    # Military presence
-        
-        # Weighted combination (results in 0-1 scale)
-        base_utility = (food_w * food_score + 
-                    route_w * normalized_route + 
-                    units_w * normalized_units + 
-                    aggro_w * normalized_aggro)
+        # Use ANN or hardcoded weights based on toggle
+        if self.use_ann_for_utility:
+            # Use ANN to predict utility directly (bypass hardcoded weights)
+            scores = self.scores_to_nn_input(food_score, normalized_units, normalized_route, normalized_aggro)
+            # Flatten the 4x1 array to 1D for feedforward
+            scores_flat = scores.flatten()
+            base_utility = self.ann.feedforward(scores_flat).item()
+        else:
+            # Use hardcoded weights (original behavior)
+            # Weights (should sum to 1.0 for proper scaling)
+            food_w = 0.6     # Food is most important for winning
+            route_w = 0.1     # efficiency 
+            units_w = 0.1     # more ants the better
+            aggro_w = 0.2    # Military presence
+            
+            # Weighted combination (results in 0-1 scale)
+            base_utility = (food_w * food_score + 
+                        route_w * normalized_route + 
+                        units_w * normalized_units + 
+                        aggro_w * normalized_aggro)
         
         # if food goal reached, should be close to 1.0
         if next_inv.foodCount >= FOOD_GOAL:
@@ -277,6 +306,15 @@ class AIPlayer(Player):
         if has_r_soldier:
             score += 0.5
         return score
+
+    ## compute_food_score
+    # computes a score [0,1] based on food progress toward the goal
+    # Higher score means closer to food goal
+    def compute_food_score(self, state):
+        myId = state.whoseTurn
+        myInv = state.inventories[myId]
+        food_score = min(myInv.foodCount / float(FOOD_GOAL), 1.0)
+        return food_score
 
     ##
     # compute_route_score
@@ -407,19 +445,20 @@ class AIPlayer(Player):
         return clamp(avg_aggression)
         
     ## scores_to_nn_input
-    # Maps the outputs from the three score computation functions to a 3x1 vector
+    # Maps the outputs from the four score computation functions to a 4x1 vector
     # suitable for neural network input
     #
     # Parameters:
+    #   food_score - output from compute_food_score [0, 1]
     #   unit_score - output from compute_unit_composition_score [0, 1]
     #   route_score - output from compute_route_score [0, 1]
     #   aggro_score - output from compute_rsoldier_aggression_score [0, 1]
     #
     # Returns:
-    #   numpy array of shape (3, 1) containing the three scores
+    #   numpy array of shape (4, 1) containing the four scores
     #
-    def scores_to_nn_input(self, unit_score, route_score, aggro_score):
-        return np.array([[unit_score], [route_score], [aggro_score]])
+    def scores_to_nn_input(self, food_score, unit_score, route_score, aggro_score):
+        return np.array([[food_score], [unit_score], [route_score], [aggro_score]])
 
     ## Node representation
     #
@@ -491,8 +530,8 @@ data = [
 
 class ANN():
   # network layer dimensions 
-  INPUT_DIMENSION = 3
-  HIDDEN_LAYER_DIMENSION = 3
+  INPUT_DIMENSION = 4
+  HIDDEN_LAYER_DIMENSION = 4
   OUTPUT_DIMENSION = 1
   
   # network properties
@@ -577,8 +616,8 @@ class ANN():
       if epoch % 100 == 0:
         print("Epoch:\t", epoch, "Error:\t", avg_loss)
       
-      if avg_loss < 0.05:
-        print(f"Stopped early: error < 0.05 at epoch {epoch}")
+      if avg_loss < 0.02:
+        print(f"Stopped early: error < 0.02 at epoch {epoch}")
         break
       
       if epochs_without_improvement >= patience:
