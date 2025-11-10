@@ -2,6 +2,7 @@ import random
 import heapq
 import itertools
 import sys
+import os
 import numpy as np
 sys.path.append("..")
 from Player import *
@@ -32,10 +33,41 @@ class AIPlayer(Player):
     ##
     def __init__(self, inputPlayerId):
         super(AIPlayer,self).__init__(inputPlayerId, "Neural Network Agent")
-        # Persistent list to track all state XY combinations for neural network training
-        self.training_data = []
-        # Initialize ANN for learning utility function
-        self.ann = ANN()
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.data_file = os.path.join(base_dir, "ann_data.npz")
+        self.MAX_DATASET_SIZE = 5000
+        self.games_trained = 0
+        
+        if os.path.exists(self.data_file):
+            try:
+                data = np.load(self.data_file)
+                X_all = data['X_all']
+                Y_all = data['Y_all']
+                self.training_data = [
+                    [X_all[i].reshape(3, 1), np.array([[Y_all[i]]])]
+                    for i in range(len(X_all))
+                ]
+                if len(self.training_data) > self.MAX_DATASET_SIZE:
+                    self.training_data = self.training_data[-self.MAX_DATASET_SIZE:]
+                    print(f"Loaded dataset limited to {self.MAX_DATASET_SIZE} examples")
+                
+                self.ann = ANN()
+                self.ann.weights_input_hidden = data['weights_input_hidden']
+                self.ann.weights_hidden_output = data['weights_hidden_output']
+                self.ann.bias_hidden = data['bias_hidden']
+                self.ann.bias_output = data['bias_output']
+                
+                if 'games_trained' in data:
+                    self.games_trained = int(data['games_trained'].item())
+                
+                print(f"Loaded {len(self.training_data)} examples and trained ANN (trained on {self.games_trained} games)")
+            except Exception as e:
+                print(f"Error loading data: {e}. Starting fresh.")
+                self.training_data = []
+                self.ann = ANN()
+        else:
+            self.training_data = []
+            self.ann = ANN()
     
     ##
     #getPlacement
@@ -128,20 +160,55 @@ class AIPlayer(Player):
     #registerWin
     #
     def registerWin(self, hasWon):
-        # Train the ANN on collected training data if we have any
-        if len(self.training_data) > 0:
-            # Shuffle training data in random order
-            shuffled_data = random.sample(self.training_data, len(self.training_data))
-            
-            # Separate into X (inputs) and Y (outputs)
-            # X is 3x1 array, need to flatten to 1D for training
-            # Y is 1x1 array, need to extract scalar value
-            X = np.array([example[0].flatten() for example in shuffled_data])
-            Y = np.array([example[1].item() for example in shuffled_data])
-            
-            # Train the neural network
-            self.ann.train(X, Y, epochs=50000, learning_rate=0.1)
+        if len(self.training_data) < 10:
+            return
+        
+        if len(self.training_data) > self.MAX_DATASET_SIZE:
+            self.training_data = self.training_data[-self.MAX_DATASET_SIZE:]
+            print(f"Dataset limited to {self.MAX_DATASET_SIZE} examples")
+        
+        shuffled_data = random.sample(self.training_data, len(self.training_data))
+        split_index = int(len(shuffled_data) * 0.8)
+        train_data = shuffled_data[:split_index]
+        test_data = shuffled_data[split_index:]
 
+        X_train = np.array([ex[0].flatten() for ex in train_data])
+        Y_train = np.array([ex[1].item() for ex in train_data])
+        X_test = np.array([ex[0].flatten() for ex in test_data])
+        Y_test = np.array([ex[1].item() for ex in test_data])
+        
+        self.ann.train(X_train, Y_train, epochs=10000, learning_rate=0.1)
+        test_predictions = [self.ann.feedforward(x) for x in X_test]
+        test_errors = [abs(y_true - y_pred.item()) for y_true, y_pred in zip(Y_test, test_predictions)]
+        avg_test_error = sum(test_errors) / len(test_errors)
+        
+        self.games_trained += 1
+        print(f"Test error: {avg_test_error:.4f} (trained on {len(train_data)}, tested on {len(test_data)}) - Game {self.games_trained}")
+        
+        self._save_data()
+    
+    def _save_data(self):
+        if len(self.training_data) == 0:
+            return
+        
+        try:
+            X_all = np.array([ex[0].flatten() for ex in self.training_data])
+            Y_all = np.array([ex[1].item() for ex in self.training_data])
+            
+            np.savez(
+                self.data_file,
+                X_all=X_all,
+                Y_all=Y_all,
+                weights_input_hidden=self.ann.weights_input_hidden,
+                weights_hidden_output=self.ann.weights_hidden_output,
+                bias_hidden=self.ann.bias_hidden,
+                bias_output=self.ann.bias_output,
+                num_examples=np.array([len(self.training_data)]),
+                games_trained=np.array([self.games_trained])
+            )
+            print(f"Saved {len(self.training_data)} examples and ANN")
+        except Exception as e:
+            print(f"Error saving data: {e}")
 
     ##
     # utility
@@ -485,24 +552,37 @@ class ANN():
     self.bias_hidden += np.sum(hidden_delta, axis=0, keepdims=True) * learning_rate
   
   def train(self, X, Y, epochs, learning_rate):
-    average_loss = 0
+    best_error = float('inf')
+    patience = 500
+    min_improvement = 0.0005
+    epochs_without_improvement = 0
+    
     for epoch in range(epochs+1):
-      
       losses = []
       for x, y in zip(X, Y):
         y_hat = self.feedforward(x)
-        # perform backpropagation for every epoch
         losses.append(abs(y - y_hat))
         self.backward(x, y, learning_rate)
       
-      # calculate the average loss of the epoch
       avg_loss = sum(losses) / len(losses)
+      if isinstance(avg_loss, np.ndarray):
+        avg_loss = avg_loss.item()
+      
+      if avg_loss < best_error - min_improvement:
+        best_error = avg_loss
+        epochs_without_improvement = 0
+      else:
+        epochs_without_improvement += 1
+      
       if epoch % 100 == 0:
-        # print the average loss % every 100 epochs (should see a decrease in error)
         print("Epoch:\t", epoch, "Error:\t", avg_loss)
       
-      # if the average loss is less than 0.05, stop training to prevent overfitting
       if avg_loss < 0.05:
+        print(f"Stopped early: error < 0.05 at epoch {epoch}")
+        break
+      
+      if epochs_without_improvement >= patience:
+        print(f"Stopped early: no improvement for {patience} epochs (best: {best_error:.4f})")
         break
       
   
